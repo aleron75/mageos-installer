@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+#
+# mageos-install - installs Mage-OS Composer packages.
+#
+# Implements the specification in plan.md. Targets bash 3.2 (macOS default):
+# no mapfile/readarray, no associative arrays, no "${var,,}". Package lists
+# are kept as newline separated strings instead of arrays, both because
+# bash 3.2 mishandles "${arr[@]}" on empty arrays under `set -u`, and because
+# package specs (matching [a-z0-9_.-]+/[a-z0-9_.-]+(:constraint)?) never
+# contain spaces or glob characters, so plain word-splitting is safe.
+
+set -u
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+DRY_RUN=0
+COMMAND=""
+
+# Package line formats (see plan.md "Line format").
+PKG_RE='^[a-z0-9_.-]+/[a-z0-9_.-]+(:[^[:space:]]+)?$'
+COMMENTED_PKG_RE='^#[[:space:]]*[a-z0-9_.-]+/[a-z0-9_.-]+(:[^[:space:]]+)?$'
+
+# Temporary files to remove on exit, newline separated.
+TEMP_FILES=""
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+register_tmp() {
+    TEMP_FILES="${TEMP_FILES}${TEMP_FILES:+$'\n'}$1"
+}
+
+cleanup() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ -f "$f" ] && rm -f "$f"
+    done <<< "$TEMP_FILES"
+}
+trap cleanup EXIT
+
+error() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# Trim leading/trailing whitespace (including \r) from a string.
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Confirmation prompt. Returns (via normal function return) only on "yes".
+# On "no" (or empty answer) it exits the whole script per spec.
+confirm() {
+    local question="$1" answer
+    while true; do
+        printf '%s [y/N] ' "$question"
+        read -r answer
+        case "$answer" in
+            y|Y|yes|Yes|YES)
+                return 0
+                ;;
+            n|N|no|No|NO|"")
+                echo "Ended by the user"
+                exit 0
+                ;;
+            *)
+                echo "Please answer y or n."
+                ;;
+        esac
+    done
+}
+
+# Checks that every command name given as argument is available.
+# Lists all missing commands at once before stopping.
+check_prerequisites() {
+    local missing="" cmd
+    for cmd in "$@"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing="${missing}${missing:+, }${cmd}"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        error "missing required command(s): $missing. Please install them and try again."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Script location / configuration files
+# ---------------------------------------------------------------------------
+
+# Resolves the real directory of a script path, following symlinks one hop
+# at a time (portable equivalent of GNU `readlink -f`, which is not
+# available on macOS). Also resolves bare command names found via PATH,
+# so the script still finds its config files when invoked as `mageos-install`
+# after adding bin/ to PATH.
+resolve_dir() {
+    local src="$1" dir
+    case "$src" in
+        */*) ;;
+        *) src=$(command -v "$src" 2>/dev/null || printf '%s' "$src") ;;
+    esac
+    while [ -h "$src" ]; do
+        dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+        src=$(readlink "$src")
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+
+SCRIPT_DIR=$(resolve_dir "$0")
+INSTALL_DIR=$(dirname "$SCRIPT_DIR")
+BASE_CONF="$INSTALL_DIR/mageos-base.conf"
+ADDITIONAL_CONF="$INSTALL_DIR/mageos-additional.conf"
+
+# ---------------------------------------------------------------------------
+# Config file parsing (see plan.md "Line format")
+# ---------------------------------------------------------------------------
+
+# Classifies one already-trimmed line. Sets LINE_TYPE to one of:
+# empty, active, commented, description, other. Sets LINE_NAME for
+# active/commented lines (package name, with constraint if present).
+classify_line() {
+    local line="$1" rest
+    if [ -z "$line" ]; then
+        LINE_TYPE=empty
+        return
+    fi
+    if [[ "$line" =~ $PKG_RE ]]; then
+        LINE_TYPE=active
+        LINE_NAME="$line"
+        return
+    fi
+    if [[ "$line" =~ $COMMENTED_PKG_RE ]]; then
+        LINE_TYPE=commented
+        rest="${line#\#}"
+        rest=$(trim "$rest")
+        LINE_NAME="$rest"
+        return
+    fi
+    case "$line" in
+        "#"*) LINE_TYPE=description ;;
+        *) LINE_TYPE=other ;;
+    esac
+}
+
+# Reads a config file and prints "type<TAB>name" for every line
+# (name empty for empty/description/other lines).
+read_lines() {
+    local file="$1" raw trimmed
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        trimmed=$(trim "$raw")
+        classify_line "$trimmed"
+        printf '%s\t%s\n' "$LINE_TYPE" "${LINE_NAME:-}"
+    done < "$file"
+}
+
+# Prints the active package specs (name, with constraint if any) of a file.
+get_active_packages() {
+    local file="$1" type name
+    while IFS=$'\t' read -r type name; do
+        [ "$type" = "active" ] && printf '%s\n' "$name"
+    done < <(read_lines "$file")
+}
+
+# Prints the package names (constraint stripped) of active AND commented
+# lines of a file. Used to know which packages mageos-base.conf already
+# lists, whether uncommented or not.
+get_base_package_names() {
+    local file="$1" type name
+    while IFS=$'\t' read -r type name; do
+        case "$type" in
+            active|commented) printf '%s\n' "${name%%:*}" ;;
+        esac
+    done < <(read_lines "$file")
+}
+
+# ---------------------------------------------------------------------------
+# Help / usage
+# ---------------------------------------------------------------------------
+
+show_help() {
+    cat <<'EOF'
+Mage-OS Installer
+
+Description:
+    Install Mage-OS packages on the current Magento installation.
+
+Usage:
+    mageos-install [options] <command>
+
+Options:
+    -d, --dry-run                  Runs the command without applying any change
+    -h, --help                     Displays this help message
+
+Available commands:
+    init                           Downloads the list of additional packages into mageos-additional.conf
+    install                        Installs the packages of mageos-base.conf plus the ones selected in mageos-additional.conf
+EOF
+}
+
+# Prints an error followed by the help message and exits 1 (unknown
+# command or option).
+unknown_arg() {
+    echo "Error: unknown command or option: $1" >&2
+    echo >&2
+    show_help
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# init command
+# ---------------------------------------------------------------------------
+
+# Downloads additional mage-os/ packages from Packagist, filters, dedupes,
+# sorts and formats them. Sets RESULT_CONTENT (file body) and RESULT_COUNT.
+fetch_additional_packages() {
+    local base_names raw_tmp url page filtered
+    local name json block count=0 blocks=""
+
+    base_names=$(get_base_package_names "$BASE_CONF")
+
+    raw_tmp=$(mktemp "${TMPDIR:-/tmp}/mageos-search.XXXXXX")
+    register_tmp "$raw_tmp"
+
+    # Paginate through the Packagist search API, following "next".
+    url="https://packagist.org/search.json?q=mage-os&per_page=100"
+    while [ -n "$url" ]; do
+        page=$(curl -fsS "$url") || error "failed to download the package list from Packagist."
+        printf '%s' "$page" | jq -c '.results[] | select(.name | startswith("mage-os/"))' >> "$raw_tmp"
+        url=$(printf '%s' "$page" | jq -r '.next // empty')
+    done
+
+    # Filter out packages already in mageos-base.conf, dedupe by name and
+    # sort alphabetically. "name<TAB>json" lines let `sort` key on the name
+    # while keeping the full record for later formatting.
+    filtered=$(
+        while IFS= read -r json; do
+            [ -z "$json" ] && continue
+            name=$(printf '%s' "$json" | jq -r '.name')
+            if printf '%s\n' "$base_names" | grep -Fxq "$name"; then
+                continue
+            fi
+            printf '%s\t%s\n' "$name" "$json"
+        done < "$raw_tmp" | sort -t "$(printf '\t')" -k1,1 -u
+    )
+
+    while IFS=$'\t' read -r name json; do
+        [ -z "$json" ] && continue
+        block=$(printf '%s' "$json" | jq -r '
+            ((.description // "") | gsub("\r"; "")
+                | if . == "" then "No description available" else . end
+                | split("\n") | map("# " + .) | join("\n"))
+            + "\n#" + .name
+        ')
+        blocks="${blocks}${blocks:+$'\n\n'}${block}"
+        count=$((count + 1))
+    done <<< "$filtered"
+
+    if [ "$count" -eq 0 ]; then
+        error "no additional Mage-OS packages found on Packagist."
+    fi
+
+    RESULT_CONTENT="$blocks"
+    RESULT_COUNT="$count"
+}
+
+cmd_init() {
+    [ -f "$BASE_CONF" ] || error "base configuration file not found: $BASE_CONF"
+
+    confirm "This will connect to packagist.org to download the list of additional Mage-OS packages."
+
+    if [ -f "$ADDITIONAL_CONF" ]; then
+        confirm "mageos-additional.conf already exists; its content, including your current package selection, will be overwritten. Continue?"
+    fi
+
+    RESULT_CONTENT=""
+    RESULT_COUNT=0
+    fetch_additional_packages
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s\n' "$RESULT_CONTENT"
+        return
+    fi
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/mageos-additional.XXXXXX")
+    register_tmp "$tmp"
+    printf '%s\n' "$RESULT_CONTENT" > "$tmp"
+    mv "$tmp" "$ADDITIONAL_CONF"
+
+    echo "Edit mageos-additional.conf to select the packages, then run mageos-install install"
+}
+
+# ---------------------------------------------------------------------------
+# install command
+# ---------------------------------------------------------------------------
+
+# Removes duplicate package entries by name (keeping the first occurrence,
+# constraint included), preserving order. Reads/writes newline separated
+# lists via stdin/stdout.
+dedupe_by_name() {
+    local entry name seen="" result=""
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        name="${entry%%:*}"
+        if [ -n "$seen" ] && printf '%s\n' "$seen" | grep -Fxq "$name"; then
+            continue
+        fi
+        seen="${seen}${seen:+$'\n'}${name}"
+        result="${result}${result:+$'\n'}${entry}"
+    done
+    printf '%s\n' "$result"
+}
+
+# Prints a notice for packages of the given list that are already present
+# in composer.json's "require" section (reported, not skipped).
+report_already_required() {
+    local list="$1" required entry name any=0
+
+    [ -f composer.json ] || return 0
+    required=$(jq -r '.require // {} | keys[]' composer.json 2>/dev/null) || return 0
+    [ -z "$required" ] && return 0
+
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        name="${entry%%:*}"
+        if printf '%s\n' "$required" | grep -Fxq "$name"; then
+            if [ "$any" -eq 0 ]; then
+                echo "Already required in composer.json (will still be included):"
+                any=1
+            fi
+            echo "  $name"
+        fi
+    done <<< "$list"
+}
+
+cmd_install() {
+    [ -f "$BASE_CONF" ] || error "base configuration file not found: $BASE_CONF"
+    if [ ! -f "$ADDITIONAL_CONF" ]; then
+        echo "Error: mageos-additional.conf not found. Run 'mageos-install init' first." >&2
+        exit 1
+    fi
+
+    local base_active additional_active combined deduped count
+
+    base_active=$(get_active_packages "$BASE_CONF")
+    additional_active=$(get_active_packages "$ADDITIONAL_CONF")
+    combined=$(printf '%s\n%s\n' "$base_active" "$additional_active" | sed '/^$/d')
+    deduped=$(printf '%s\n' "$combined" | dedupe_by_name)
+    deduped=$(printf '%s\n' "$deduped" | sed '/^$/d')
+
+    count=0
+    if [ -n "$deduped" ]; then
+        count=$(printf '%s\n' "$deduped" | sed '/^$/d' | wc -l | tr -d ' ')
+    fi
+
+    # Not explicitly covered by plan.md (spec gap): an empty package list
+    # (empty base + nothing selected in additional) has no defined
+    # behaviour. Treated as an error rather than calling Composer with no
+    # packages.
+    if [ "$count" -eq 0 ]; then
+        echo "Error: no packages to install. Add active packages to mageos-base.conf or uncomment some in mageos-additional.conf." >&2
+        exit 1
+    fi
+
+    report_already_required "$deduped"
+
+    echo "Packages to install:"
+    printf '  %s\n' $deduped
+
+    confirm "$count packages will be installed through Composer. Proceed?"
+
+    local dry_flag=""
+    [ "$DRY_RUN" -eq 1 ] && dry_flag="--dry-run"
+
+    # Single composer invocation: installing packages one at a time is
+    # slower and can fail on constraints that resolve fine together.
+    composer require $dry_flag $deduped
+    exit $?
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing / dispatch
+# ---------------------------------------------------------------------------
+
+# Options may appear before or after the command.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        init|install)
+            [ -n "$COMMAND" ] && unknown_arg "$1"
+            COMMAND="$1"
+            shift
+            ;;
+        *)
+            unknown_arg "$1"
+            ;;
+    esac
+done
+
+# No command given (with or without other options): show help, per the
+# "run without arguments" case in plan.md.
+if [ -z "$COMMAND" ]; then
+    show_help
+    exit 0
+fi
+
+case "$COMMAND" in
+    init)
+        check_prerequisites curl jq
+        cmd_init
+        ;;
+    install)
+        check_prerequisites jq composer
+        cmd_install
+        ;;
+esac
